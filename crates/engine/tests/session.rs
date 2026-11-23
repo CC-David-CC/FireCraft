@@ -138,14 +138,39 @@ fn journal_persists_through_injected_file_system() {
 fn mark_clean_round_trips() {
     let (mut session, ids) = session();
     assert!(!session.is_dirty());
+    let original = session.revision();
     session
         .apply("object.setOpacity", json!({ "id": ids[0], "opacity": 100 }))
         .expect("apply");
     assert!(session.is_dirty());
+    let saved = session.revision();
+    assert_ne!(saved, original);
     session.mark_clean();
     assert!(!session.is_dirty());
+    assert_eq!(session.revision(), saved);
     session.undo().expect("undo");
     assert!(session.is_dirty(), "undo is also an edit");
+    let undone = session.revision();
+    assert_ne!(undone, saved);
+    session.redo().expect("redo");
+    assert_ne!(session.revision(), undone);
+}
+
+#[test]
+fn rolling_back_a_saved_transaction_invalidates_its_revision() {
+    let (mut session, ids) = session();
+    let original = DocumentBytes::of(session.document());
+    session.begin_transaction("move").expect("begin");
+    session
+        .apply("object.setOpacity", json!({ "id": ids[0], "opacity": 100 }))
+        .expect("apply");
+    let saved = session.revision();
+    session.mark_clean();
+
+    session.abort_transaction().expect("abort");
+    assert_eq!(DocumentBytes::of(session.document()), original);
+    assert_ne!(session.revision(), saved);
+    assert!(session.is_dirty());
 }
 
 #[test]

@@ -22,6 +22,7 @@ pub struct Session {
     journal: Journal,
     open_txn: Option<String>,
     dirty: bool,
+    revision: u64,
 }
 
 impl Session {
@@ -47,6 +48,7 @@ impl Session {
             journal: Journal::new(),
             open_txn: None,
             dirty: false,
+            revision: 0,
         }
     }
 
@@ -78,7 +80,7 @@ impl Session {
             },
             delta.clone(),
         );
-        self.dirty = true;
+        self.document_changed();
         Ok(delta)
     }
 
@@ -107,8 +109,11 @@ impl Session {
         let Some(label) = self.open_txn.take() else {
             return Ok(());
         };
-        self.history.abort_transaction(&mut self.document)?;
+        let undone = self.history.abort_transaction(&mut self.document)?;
         self.journal.rollback_txn(&label);
+        if undone != 0 {
+            self.document_changed();
+        }
         Ok(())
     }
 
@@ -125,7 +130,7 @@ impl Session {
         step.delta.apply_inverse(&mut self.document)?;
         let label = step.label.clone();
         self.history.file_redo(step);
-        self.dirty = true;
+        self.document_changed();
         Ok(label)
     }
 
@@ -139,7 +144,7 @@ impl Session {
         }
         let label = step.label.clone();
         self.history.file_undo(step);
-        self.dirty = true;
+        self.document_changed();
         Ok(label)
     }
 
@@ -197,9 +202,22 @@ impl Session {
         self.dirty
     }
 
+    /// Changes whenever an edit, undo, redo or rollback changes this
+    /// session. Save acknowledgements can compare it with a snapshot
+    /// without rendering and serializing the document a second time.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Clears the dirty flag (after a successful save/export).
     pub fn mark_clean(&mut self) {
         self.dirty = false;
+    }
+
+    fn document_changed(&mut self) {
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// The session-restart path: fresh document + journal lines in,

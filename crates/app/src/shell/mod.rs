@@ -21,6 +21,8 @@ mod guides_ui;
 mod icons;
 mod palette;
 mod panels;
+#[cfg(target_arch = "wasm32")]
+mod workspace;
 
 pub use glyphs::apply_cs6_theme;
 pub(crate) use glyphs::{draw_autoshape_glyph, symbol_type_label, tool_key, tool_label};
@@ -37,15 +39,14 @@ use crate::editor::{
 };
 use crate::menus;
 
-/// The web drop sink ([`Shell::set_drop_sink`]): the web crate's async
-/// file reader, installed at startup. Wasm only — the desktop shell
-/// reads dropped bytes directly. No `Send`/`Sync` bound: wasm is
-/// single-threaded and the sink captures `Rc<WebRunner>`, so the
-/// holder is a `thread_local` (a `static Mutex` would demand `Send`).
+#[cfg(target_arch = "wasm32")]
+type DropSink = std::rc::Rc<dyn Fn(&egui::DroppedFileHandle, egui::Context)>;
+
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    static DROP_SINK: std::cell::RefCell<Option<std::rc::Rc<dyn Fn(&egui::DroppedFileHandle, egui::Context)>>> =
-        const { std::cell::RefCell::new(None) };
+    /// The web crate's asynchronous dropped-file reader. It captures
+    /// the single-threaded browser runner.
+    static DROP_SINK: std::cell::RefCell<Option<DropSink>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The eframe app. Holds the editor core plus everything window-shaped.
@@ -55,7 +56,7 @@ thread_local! {
 pub struct Shell {
     /// The editor core (document, tools, selection).
     pub editor: Editor,
-    /// Canvas view (pan/zoom).
+    /// Current canvas viewport.
     pub view: View,
     /// Cached page raster + the document stamp it was made from.
     raster: Option<(TextureHandle, (usize, usize, usize))>,
@@ -126,6 +127,8 @@ pub struct Shell {
     /// mutates the shell — without one, a bridge-loaded document sat
     /// behind a stale untitled canvas until the next input event.
     ctx: Option<egui::Context>,
+    #[cfg(target_arch = "wasm32")]
+    workspace: Option<workspace::Workspace>,
 }
 
 impl Shell {
@@ -178,6 +181,8 @@ impl Shell {
             guide_draft: None,
             context_menu: None,
             ctx: None,
+            #[cfg(target_arch = "wasm32")]
+            workspace: None,
         }
     }
 
@@ -188,6 +193,14 @@ impl Shell {
     pub fn request_repaint(&self) {
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
+        }
+    }
+
+    fn replace_editor(&mut self, editor: Editor) {
+        self.editor = editor;
+        #[cfg(target_arch = "wasm32")]
+        if let Some(workspace) = &mut self.workspace {
+            workspace.document_replaced();
         }
     }
 
@@ -208,7 +221,7 @@ impl Shell {
             Ok(editor) => {
                 self.raster = None;
                 self.raster_scale = 1.0;
-                self.editor = editor;
+                self.replace_editor(editor);
                 self.view = View::default();
                 self.status = "opened document".to_owned();
                 Ok(())
@@ -279,7 +292,7 @@ impl Shell {
                 self.status = format!("opened {path}");
                 self.raster = None;
                 self.raster_scale = 1.0;
-                self.editor = editor;
+                self.replace_editor(editor);
                 self.view = View::default();
                 self.doc_name = std::path::Path::new(&path)
                     .file_name()
@@ -472,7 +485,7 @@ impl Shell {
         match replayed {
             Ok(editor) => {
                 let rows = editor.session.journal_len();
-                self.editor = editor;
+                self.replace_editor(editor);
                 self.view = View::default();
                 self.raster = None;
                 self.raster_scale = 1.0;
@@ -586,9 +599,21 @@ impl Shell {
 
     /// Shell-level plumbing: file, history, selection, view.
     fn run_shell(&mut self, action: menus::ShellAction) {
+        #[cfg(target_arch = "wasm32")]
+        if self.queue_workspace_action(action) {
+            return;
+        }
         match action {
             menus::ShellAction::New => {
-                self.editor = Editor::untitled();
+                #[cfg(target_arch = "wasm32")]
+                if !self.workspace_allows_replace() {
+                    return;
+                }
+                self.replace_editor(Editor::untitled());
+                #[cfg(target_arch = "wasm32")]
+                if self.workspace.is_some() {
+                    self.editor.session.mark_clean();
+                }
                 self.view = View::default();
                 self.raster = None;
                 self.raster_scale = 1.0;
@@ -1199,12 +1224,12 @@ impl Shell {
     /// runner. `None` until then — a drop before startup is a no-op
     /// (the status line already said the app was still coming up).
     #[cfg(target_arch = "wasm32")]
-    pub fn set_drop_sink(sink: std::rc::Rc<dyn Fn(&egui::DroppedFileHandle, egui::Context)>) {
+    pub fn set_drop_sink(sink: DropSink) {
         DROP_SINK.with(|cell| *cell.borrow_mut() = Some(sink));
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn drop_sink() -> Option<std::rc::Rc<dyn Fn(&egui::DroppedFileHandle, egui::Context)>> {
+    fn drop_sink() -> Option<DropSink> {
         DROP_SINK.with(|cell| cell.borrow().clone())
     }
 

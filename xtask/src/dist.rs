@@ -658,7 +658,8 @@ fn serve(staged: &[PathBuf], smoke: &str) -> Result<Server, String> {
             .unwrap_or("")
         {
             "wasm" => "application/wasm",
-            "js" => "text/javascript",
+            "js" | "mjs" => "text/javascript",
+            "css" => "text/css",
             "html" => "text/html; charset=utf-8",
             _ => "application/octet-stream",
         };

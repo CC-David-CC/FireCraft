@@ -10,6 +10,8 @@
 
 #[cfg(target_arch = "wasm32")]
 mod platform;
+#[cfg(target_arch = "wasm32")]
+mod workspace;
 
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
@@ -59,7 +61,7 @@ fn reply_status(kind: &str, ok: bool, error: Option<&str>) {
 
 /// Best-effort string for a rejected `JsValue` error.
 #[cfg(target_arch = "wasm32")]
-fn js_error_text(value: wasm_bindgen::JsValue) -> String {
+fn js_error_text(value: &wasm_bindgen::JsValue) -> String {
     value
         .as_string()
         .unwrap_or_else(|| "unknown error".to_owned())
@@ -95,12 +97,18 @@ fn with_app<T>(
 }
 
 #[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
+#[wasm_bindgen::prelude::wasm_bindgen]
 pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
     use wasm_bindgen::JsCast as _;
     use wasm_bindgen::JsValue;
 
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let hosted = window
+        .location()
+        .search()?
+        .trim_start_matches('?')
+        .split('&')
+        .any(|part| part == "webos");
     let document = window
         .document()
         .ok_or_else(|| JsValue::from_str("no document"))?;
@@ -121,10 +129,7 @@ pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
     // the picker must not hide files the app can open.
     input.set_accept(".fw.png,.png,.jpg,.jpeg,.gif,.bmp,.tif,.tiff,.webp,image/*");
     input.set_id("firecraft-file-input");
-    let _ = input.set_attribute(
-        "style",
-        "position:absolute;width:1px;height:1px;opacity:0;pointer-events:none",
-    );
+    input.set_hidden(true);
     let body = document
         .body()
         .ok_or_else(|| JsValue::from_str("no document body"))?;
@@ -148,12 +153,21 @@ pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
             input.set_value("");
             match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
                 Ok(value) => match value.dyn_into::<js_sys::ArrayBuffer>() {
-                    Ok(buffer) => open_bytes(&runner, &js_sys::Uint8Array::new(&buffer).to_vec()),
+                    Ok(buffer) => {
+                        let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                        if hosted {
+                            with_app(&runner, |shell| {
+                                workspace::load_local_file(shell, &file.name(), &bytes);
+                            });
+                        } else {
+                            open_bytes(&runner, &bytes);
+                        }
+                    }
                     Err(_) => {
                         reply_status("opened", false, Some("picked file is not an ArrayBuffer"))
                     }
                 },
-                Err(error) => reply_status("opened", false, Some(&js_error_text(error))),
+                Err(error) => reply_status("opened", false, Some(&js_error_text(&error))),
             }
         });
     });
@@ -162,29 +176,36 @@ pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
     // The listener must outlive this function — leak it deliberately.
     input_callback.forget();
 
-    // postMessage bridge.
-    let message_runner = runner.clone();
-    let message_callback = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::MessageEvent)>::new(
-        move |event: web_sys::MessageEvent| handle_message(&message_runner, event),
-    );
-    window
-        .add_event_listener_with_callback("message", message_callback.as_ref().unchecked_ref())?;
-    message_callback.forget();
+    if !hosted {
+        let message_runner = runner.clone();
+        let message_callback = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::MessageEvent)>::new(
+            move |event: web_sys::MessageEvent| handle_message(&message_runner, &event),
+        );
+        window.add_event_listener_with_callback(
+            "message",
+            message_callback.as_ref().unchecked_ref(),
+        )?;
+        message_callback.forget();
+    }
 
     runner
         .start(
             canvas,
             eframe::WebOptions::default(),
-            Box::new(|cc| {
+            Box::new(move |cc| {
                 // The web build has no `Shell::new`, so the CS6 theme
                 // has to be applied here — without it the deployed app
                 // rendered egui's default light chrome.
                 app::shell::apply_cs6_theme(&cc.egui_ctx);
-                Ok(Box::new(app::shell::Shell::with_platform(
+                let mut shell = app::shell::Shell::with_platform(
                     app::editor::Editor::untitled(),
                     std::rc::Rc::new(platform::WebFs),
                     Box::new(platform::WebDialogs),
-                )))
+                );
+                if hosted {
+                    shell.enable_workspace_files(workspace::confirm_discard);
+                }
+                Ok(Box::new(shell))
             }),
         )
         .await?;
@@ -203,7 +224,15 @@ pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
             match file.bytes_async().await {
                 Ok(bytes) => {
                     with_app(&runner, |shell| {
-                        let _ = shell.load_document_bytes(&bytes);
+                        if hosted {
+                            workspace::load_local_file(
+                                shell,
+                                &file.path().to_string_lossy(),
+                                &bytes,
+                            );
+                        } else {
+                            let _ = shell.load_document_bytes(&bytes);
+                        }
                     });
                 }
                 Err(error) => {
@@ -216,7 +245,11 @@ pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
         });
     }));
 
-    reply_status("ready", true, None);
+    if hosted {
+        workspace::register(runner);
+    } else {
+        reply_status("ready", true, None);
+    }
     Ok(())
 }
 
@@ -234,7 +267,7 @@ fn open_bytes(runner: &std::rc::Rc<eframe::WebRunner>, bytes: &[u8]) {
 /// `source: "firecraft"`) are ignored; a bare `ArrayBuffer` is
 /// shorthand for `openDocument`.
 #[cfg(target_arch = "wasm32")]
-fn handle_message(runner: &std::rc::Rc<eframe::WebRunner>, event: web_sys::MessageEvent) {
+fn handle_message(runner: &std::rc::Rc<eframe::WebRunner>, event: &web_sys::MessageEvent) {
     use wasm_bindgen::JsCast as _;
     use wasm_bindgen::JsValue;
 

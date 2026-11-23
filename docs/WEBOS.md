@@ -12,12 +12,27 @@ release bytes on every dist run.
 
     cargo run -p xtask -- dist --web
 
-assembles `dist/web/`: the trunk `--release` bundle (`index.html`,
-one `.js`, one `.wasm`), a `MANIFEST.sha256` over every file
+assembles `dist/web/`: the locked Trunk release bundle, a
+`MANIFEST.sha256` over every file
 (`sha256sum -c MANIFEST.sha256` verifies it), the wasm size budget
 enforced, and the bridge smoke green. Serve the directory over
 HTTP(S) — `application/wasm` is required for
 `WebAssembly.instantiateStreaming`; `file://` will not work.
+
+## WebOS Files
+
+Package the browser distribution in the app's `native/` directory.
+Use `web/mount.mjs` as the app's `index.mjs` alongside WebOS's
+`binary-studio.mjs` and `workspace.css`. The mount opens
+`native/index.html?webos` and exposes the account's Files picker and
+revision-checked writer for editable `.fw.png` projects. It also handles
+Open, Import, Save and Save As from the editor's File menu and shortcuts.
+Use Import to place a raster on the active layer.
+
+The hosted frame exposes `window.wasmBindings` after the editor starts
+and uses the same-origin Files contract. Standalone frames retain the
+postMessage interface described below. The editor needs WebGL and
+WebAssembly.
 
 ## The iframe contract
 

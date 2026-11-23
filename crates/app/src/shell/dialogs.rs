@@ -470,7 +470,7 @@ impl Shell {
         editor
             .apply("bitmap.importFile", payload)
             .map_err(|error| error.to_string())?;
-        self.editor = editor;
+        self.replace_editor(editor);
         Ok(())
     }
 
